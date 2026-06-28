@@ -4,10 +4,8 @@ import numpy as np
 import plotly.graph_objects as go
 import ast
 import random
+import os
 
-# ==========================================
-# 1. NATIVE FUZZY INFERENCE SYSTEM (MAMDANI)
-# ==========================================
 class MamdaniFuzzySystem:
     @staticmethod
     def triangular(x, a, b, c):
@@ -36,27 +34,28 @@ class MamdaniFuzzySystem:
         elif a < x <= b: return (x - a) / (b - a)
         return 1.0
 
+    # Fuzzy Set
     def evaluate(self, dw, cog, overstowage, slot_error):
-        # 1. Fuzzifikasi Delta W (Keseimbangan Transversal)
-        dw_seimbang = self.trapezoid(dw, -5, -2, 2, 5)
-        dw_miring = max(self.triangular(dw, 5, 10, 15), self.triangular(dw, -15, -10, -5))
-        dw_sangat_miring = max(self.left_shoulder(dw, -20, -15), self.right_shoulder(dw, 15, 20))
+        # 1. Fuzzifikasi Dw (Keseimbangan Berat Kapal)
+        dw_seimbang = self.left_shoulder(dw, 10, 30)
+        dw_miring = self.triangular(dw, 20, 80, 150)
+        dw_sangat_miring = self.right_shoulder(dw, 100, 250)
 
-        # 2. Fuzzifikasi CoG (Stabilitas Vertikal)
-        cog_aman = self.left_shoulder(cog, 0.3, 0.4)
-        cog_waspada = self.triangular(cog, 0.4, 0.55, 0.7)
-        cog_berbahaya = self.right_shoulder(cog, 0.7, 0.8)
+        # 2. Fuzzifikasi Center of Gravity (Stabilitas Vertikal)
+        cog_aman = self.left_shoulder(cog, 0.4, 0.5)
+        cog_waspada = self.triangular(cog, 0.45, 0.6, 0.75)
+        cog_berbahaya = self.right_shoulder(cog, 0.7, 0.85)
 
-        # 3. Fuzzifikasi Over Stowage
-        ovr_ideal = self.left_shoulder(overstowage, 0, 1)
-        ovr_toleransi = self.triangular(overstowage, 0, 2.5, 5)
-        ovr_buruk = self.right_shoulder(overstowage, 4, 5)
+        # 3. Fuzzifikasi Overstowage (Pelanggaran Urutan Bongkar)
+        ovr_ideal = self.left_shoulder(overstowage, 0, 3)
+        ovr_toleransi = self.triangular(overstowage, 2, 10, 25)
+        ovr_buruk = self.right_shoulder(overstowage, 15, 40)
 
-        # 4. Fuzzifikasi Slot Mismatch
-        slt_valid = 1.0 if slot_error == 0 else 0.0
-        slt_fatal = 1.0 if slot_error >= 1 else 0.0
+        # 4. Fuzzifikasi Slot Error (Kesalahan Penempatan Container)
+        slt_valid = self.left_shoulder(slot_error, 0, 4) 
+        slt_fatal = self.right_shoulder(slot_error, 2, 20)
 
-        # EVALUASI 14 RULE BASE INFERENCE
+        # RULE BASE INFERENCE
         rules = []
         rules.append((slt_fatal, 'SANGAT_RENDAH')) 
         rules.append((cog_berbahaya, 'SANGAT_RENDAH')) 
@@ -78,7 +77,7 @@ class MamdaniFuzzySystem:
         aggregated_membership = np.zeros_like(x_output)
 
         for activation, label in rules:
-            if activation == 0: continue
+            if activation <= 0: continue 
             if label == 'SANGAT_RENDAH':
                 fuzzy_vals = np.array([self.left_shoulder(val, 0, 20) for val in x_output])
                 mu = np.minimum(activation, fuzzy_vals)
@@ -98,14 +97,19 @@ class MamdaniFuzzySystem:
             aggregated_membership = np.maximum(aggregated_membership, mu)
 
         sum_membership = np.sum(aggregated_membership)
-        if sum_membership == 0:
-            return 10.0 
         
-        return np.sum(x_output * aggregated_membership) / sum_membership
+        # FITUR BARU: Pastikan setiap individu punya skor unik lewat penalti desimal
+        raw_penalty = (dw * 0.001) + (overstowage * 0.01) + (slot_error * 0.02)
 
-# ==========================================
-# 2. HYBRID GENETIC ALGORITHM ENGINE
-# ==========================================
+        if sum_membership == 0:
+            penyebut = 1.0 + (dw * 0.01) + (overstowage * 0.1) + (slot_error * 0.2)
+            return 15.0 / (penyebut + raw_penalty) 
+        
+        base_fuzzy_score = np.sum(x_output * aggregated_membership) / sum_membership
+        
+        return base_fuzzy_score / (1.0 + raw_penalty)
+
+
 class StowageGA:
     def __init__(self, vessel_info, cargo_df, pop_size=30, generations=20, mutation_rate=0.1):
         self.vessel = vessel_info
@@ -124,38 +128,61 @@ class StowageGA:
 
     def parse_coordinates(self, coord_str):
         try:
-            return [tuple(c) for c in ast.literal_eval(f"[{coord_str}]")]
+            raw = ast.literal_eval(f"[{coord_str}]")
+            return set(tuple(int(v) for v in c) for c in raw)
         except:
-            return []
+            return set()
 
     def apply_gravity(self, chromosome):
-        """ FITUR BARU: Mencegah Kontainer Melayang (Hukum Gravitasi) """
         new_chromosome = {}
         columns = {}
         
-        # 1. Kelompokkan seluruh kontainer berdasarkan kolom vertikalnya (Bay, Row)
         for (b, r, t), item in chromosome.items():
             if (b, r) not in columns:
                 columns[(b, r)] = []
             columns[(b, r)].append((t, item))
             
-        # 2. Jatuhkan semua kontainer di tiap kolom agar menumpuk dari Tier 0 ke atas
         for (b, r), items in columns.items():
-            # Urutkan berdasarkan tier asli sebelum jatuh (mempertahankan pola GA)
-            items.sort(key=lambda x: x[0]) 
+            items.sort(key=lambda x: x[0])
             for new_t, (old_t, item) in enumerate(items):
-                new_chromosome[(b, r, new_t)] = item
+                if new_t < self.max_t:
+                    new_chromosome[(b, r, new_t)] = item
                 
         return new_chromosome
 
     def create_individual(self):
-        slots = [(b, r, t) for b in range(self.max_b) for r in range(self.max_r) for t in range(self.max_t)]
-        random.shuffle(slots)
         chromosome = {}
-        for idx, item in enumerate(self.cargo):
-            if idx < len(slots):
-                chromosome[slots[idx]] = item
-        # Terapkan gravitasi di awal pembentukan individu!
+        
+        reefers = [c for c in self.cargo if c['Tipe Cargo'].upper() == 'REEFER']
+        dgs = [c for c in self.cargo if c['Tipe Cargo'].upper() == 'DG']
+        drys = [c for c in self.cargo if c['Tipe Cargo'].upper() not in ['REEFER', 'DG']]
+        
+        random.shuffle(reefers)
+        random.shuffle(dgs)
+        random.shuffle(drys)
+        
+        reefer_slots = list(self.reefer_plugs)
+        dg_slots = list(self.dg_zones)
+        all_slots = set((b, r, t) for b in range(self.max_b) for r in range(self.max_r) for t in range(self.max_t))
+        
+        dead_slots = set()
+        for b, r, t in self.reefer_plugs.union(self.dg_zones):
+            for t_above in range(t + 1, self.max_t):
+                dead_slots.add((b, r, t_above))
+                
+        regular_slots = list(all_slots - self.reefer_plugs - self.dg_zones - dead_slots)
+        
+        random.shuffle(reefer_slots)
+        random.shuffle(dg_slots)
+        random.shuffle(regular_slots)
+        
+        for item in reefers:
+            if reefer_slots: chromosome[reefer_slots.pop()] = item
+        for item in dgs:
+            if dg_slots: chromosome[dg_slots.pop()] = item
+        for item in drys:
+            if regular_slots: chromosome[regular_slots.pop()] = item
+            
         return self.apply_gravity(chromosome)
 
     def evaluate_fitness(self, chromosome):
@@ -209,19 +236,58 @@ class StowageGA:
         cog_index = 0.0
         if total_weight > 0:
             avg_tier_height = vertical_moment / total_weight
-            cog_index = (avg_tier_height - 1) / (self.max_t - 1) if self.max_t > 1 else 0.0
+            raw_cog = (avg_tier_height - 1) / (self.max_t - 1) if self.max_t > 1 else 0.0
+            cog_index = max(0.0, min(1.0, raw_cog))
 
         fitness = self.fuzzy_sys.evaluate(dw, cog_index, overstowage_penalty, slot_error)
         stability_display = max(0, 100 - ((dw / total_weight) * 200)) if total_weight > 0 else 100
         
         return fitness, stability_display, overstowage_penalty, slot_error
 
+    def crossover(self, parent1, parent2):
+        child = {}
+        used_slots = set()
+        unassigned_cargo = []
+        
+        all_slots = [(b, r, t) for b in range(self.max_b) for r in range(self.max_r) for t in range(self.max_t)]
+        
+        for item in self.cargo:
+            c_id = item['Container ID']
+            
+            slot1 = next((k for k, v in parent1.items() if v['Container ID'] == c_id), None)
+            slot2 = next((k for k, v in parent2.items() if v['Container ID'] == c_id), None)
+            
+            chosen_slot = slot1 if random.random() < 0.5 else slot2
+            
+            if chosen_slot and chosen_slot not in used_slots:
+                child[chosen_slot] = item
+                used_slots.add(chosen_slot)
+            else:
+                unassigned_cargo.append(item) 
+                
+        available_slots = list(set(all_slots) - used_slots)
+        random.shuffle(available_slots)
+        
+        for item in unassigned_cargo:
+            if available_slots:
+                new_slot = available_slots.pop()
+                child[new_slot] = item
+                used_slots.add(new_slot)
+                
+        return self.apply_gravity(child)
+    
     def run(self):
-        population = [self.create_individual() for _ in range(self.pop_size)]
+        population = []
+        
+        for _ in range(self.pop_size):
+            population.append(self.create_individual())
+            
         best_individual = None
         best_fitness = -1.0
         best_metrics = {}
         fit_history = []
+        
+        all_slots = [(b, r, t) for b in range(self.max_b) for r in range(self.max_r) for t in range(self.max_t)]
         
         for gen in range(self.generations):
             pop_fitness_details = []
@@ -238,30 +304,48 @@ class StowageGA:
                 best_individual = current_best_ind
                 best_metrics = current_best_met
                 
-            new_population = [pop_fitness_details[0][1], pop_fitness_details[1][1]]
+            elite_count = min(2, len(pop_fitness_details))
+            new_population = [pop_fitness_details[i][1] for i in range(elite_count)]
             
-            while len(new_population) < self.pop_size:
-                parent = random.choice(pop_fitness_details[:self.pop_size // 2])[1]
-                child = parent.copy()
+            limit_crossover = self.pop_size - max(1, int(self.pop_size * 0.10))
+            
+            while len(new_population) < limit_crossover:
+                pool_size = max(1, self.pop_size // 2)
+                parent1 = random.choice(pop_fitness_details[:pool_size])[1]
+                parent2 = random.choice(pop_fitness_details[:pool_size])[1]
                 
-                # Proses Mutasi Pengacakan Slot
-                if random.random() < self.mutation_rate:
-                    coords = list(child.keys())
-                    if len(coords) >= 2:
-                        c1, c2 = random.sample(coords, 2)
-                        child[c1], child[c2] = child[c2], child[c1]
+                child = self.crossover(parent1, parent2)
                 
-                # Terapkan gravitasi setelah mutasi agar tidak ada kontainer melayang akibat di-swap!
+                if random.random() < self.mutation_rate and len(child) > 1:
+                    num_swaps = random.randint(1, 3)
+                    for _ in range(num_swaps):
+                        c_isi = random.choice(list(child.keys()))  
+                        
+                        if random.random() < 0.5:
+                            t_isi = c_isi[2]
+                            c_acak = (random.randint(0, self.max_b - 1), random.randint(0, self.max_r - 1), t_isi)
+                        else:
+                            c_acak = random.choice(all_slots)  
+                        
+                        if c_acak != c_isi:
+                            temp = child.get(c_acak)
+                            child[c_acak] = child[c_isi]
+                            if temp is not None:
+                                child[c_isi] = temp
+                            else:
+                                del child[c_isi]  
+                
                 child = self.apply_gravity(child)
                         
                 new_population.append(child)
+                
+            while len(new_population) < self.pop_size:
+                new_population.append(self.create_individual())
+                
             population = new_population
             
         return best_individual, best_fitness, best_metrics, fit_history
 
-# ==========================================
-# 3. HELPER FUNCTION UNTUK RENDERING KUBUS 3D
-# ==========================================
 def draw_3d_cube(fig, b, r, t, color, hover_text, text_id):
     dx, dy, dz = 0.4, 0.4, 0.4
     x = [b-dx, b+dx, b+dx, b-dx, b-dx, b+dx, b+dx, b-dx]
@@ -298,21 +382,22 @@ def draw_wireframe_outline(fig, b, r, t, color, name, show_legend=False):
         name=name, showlegend=show_legend, hoverinfo="skip"
     ))
 
-# ==========================================
-# 4. INTERFASE STREAMLIT DASHBOARD
-# ==========================================
 st.set_page_config(page_title="Stowage Optimizer AI", layout="wide")
-st.title("⚓ Sistem Optimasi Tata Letak Kargo Palka Kapal Dinamis")
+st.title("Sistem Optimasi Tata Letak Kargo Palka Kapal PT Pelabuhan Kelompok 2 AIML")
 st.subheader("Hybrid Genetic Algorithm & Fuzzy Inference System Mamdani")
 st.markdown("---")
 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_VESSEL_CSV = os.path.join(_BASE_DIR, "dataset_kapal.csv")
+
 try:
-    vessel_df = pd.read_csv("dataset_kapal.csv", sep=";")
+    vessel_df = pd.read_csv(_VESSEL_CSV, sep=";")
+    vessel_df.columns = vessel_df.columns.str.strip()
 except FileNotFoundError:
-    st.error("File 'dataset_kapal.csv' tidak ditemukan! Taruh file di satu folder yang sama.")
+    st.error(f"File 'dataset_kapal.csv' tidak ditemukan di: {_BASE_DIR}\nTaruh file di folder yang sama dengan app.py.")
     st.stop()
 
-st.sidebar.header("🛠️ Panel Konfigurasi Simulasi")
+st.sidebar.header("Panel Konfigurasi Simulasi")
 selected_vessel_name = st.sidebar.selectbox("Pilih Kapal Evaluasi:", vessel_df["Nama Kapal"].unique())
 vessel_info = vessel_df[vessel_df["Nama Kapal"] == selected_vessel_name].iloc[0]
 
@@ -323,9 +408,9 @@ st.sidebar.info(f"**Rute Kapal:**\n{vessel_info['Rute Pelabuhan']}\n\n"
 st.sidebar.markdown("---")
 uploaded_cargo = st.sidebar.file_uploader("Upload Dataset Kargo (.csv):", type=["csv"])
 
-pop_size = st.sidebar.slider("Ukuran Populasi GA:", min_value=10, max_value=100, value=40, step=10)
-generations = st.sidebar.slider("Jumlah Generasi Simulasi:", min_value=10, max_value=100, value=30, step=5)
-mutation_rate = st.sidebar.slider("Mutation Rate:", min_value=0.01, max_value=0.5, value=0.1, step=0.05)
+pop_size = st.sidebar.slider("Ukuran Populasi GA:", min_value=20, max_value=300, value=100, step=10)
+generations = st.sidebar.slider("Jumlah Generasi Simulasi:", min_value=10, max_value=500, value=200, step=10)
+mutation_rate = st.sidebar.slider("Mutation Rate:", min_value=0.01, max_value=1.0, value=0.3, step=0.05)
 
 if uploaded_cargo is not None:
     cargo_df = pd.read_csv(uploaded_cargo, sep=";")
@@ -333,8 +418,15 @@ if uploaded_cargo is not None:
     
     total_hold_capacity = int(vessel_info['Max Bay']) * int(vessel_info['Max Row']) * int(vessel_info['Max Tier'])
     
-    reefer_plugs_list = ast.literal_eval(f"[{vessel_info['Reefer Plugs']}]") if pd.notna(vessel_info['Reefer Plugs']) else []
-    dg_zones_list = ast.literal_eval(f"[{vessel_info['DG Zone']}]") if pd.notna(vessel_info['DG Zone']) else []
+    def _parse_coord_list(coord_str):
+        try:
+            raw = ast.literal_eval(f"[{coord_str}]")
+            return [tuple(int(v) for v in c) for c in raw]
+        except:
+            return []
+
+    reefer_plugs_list = _parse_coord_list(vessel_info['Reefer Plugs']) if pd.notna(vessel_info['Reefer Plugs']) else []
+    dg_zones_list = _parse_coord_list(vessel_info['DG Zone']) if pd.notna(vessel_info['DG Zone']) else []
     
     total_kargo_reefer = len(cargo_df[cargo_df['Tipe Cargo'].str.upper() == 'REEFER'])
     total_kargo_dg = len(cargo_df[cargo_df['Tipe Cargo'].str.upper() == 'DG'])
@@ -342,27 +434,27 @@ if uploaded_cargo is not None:
     
     is_valid = True
     
-    st.sidebar.markdown("### 📋 Status Validasi Pre-Stowage")
+    st.sidebar.markdown("### Status Validasi Pre-Stowage")
     
     if len(cargo_df) > total_hold_capacity:
-        st.sidebar.error(f"❌ **Kapasitas Penuh!** Total kargo yang diunggah ({len(cargo_df)}) melebihi slot maksimal kapal ({total_hold_capacity}).")
+        st.sidebar.error(f"**Kapasitas Penuh!** Total kargo yang diunggah ({len(cargo_df)}) melebihi slot maksimal kapal ({total_hold_capacity}).")
         is_valid = False
         
     if total_kargo_reefer > len(reefer_plugs_list):
-        st.sidebar.error(f"⚠️ **Reefer Ditolak (Rollover):** Anda membawa {total_kargo_reefer} kontainer Reefer, tetapi kapal hanya memiliki {len(reefer_plugs_list)} Reefer Plugs.")
+        st.sidebar.error(f"**Reefer Ditolak (Rollover):** Anda membawa {total_kargo_reefer} kontainer Reefer, tetapi kapal hanya memiliki {len(reefer_plugs_list)} Reefer Plugs.")
         is_valid = False
         
     if total_kargo_dg > len(dg_zones_list):
-        st.sidebar.error(f"⚠️ **DG Ditolak (Rollover):** Anda membawa {total_kargo_dg} kontainer DG, tetapi kapal hanya memiliki {len(dg_zones_list)} DG Zone yang aman.")
+        st.sidebar.error(f"**DG Ditolak (Rollover):** Anda membawa {total_kargo_dg} kontainer DG, tetapi kapal hanya memiliki {len(dg_zones_list)} DG Zone yang aman.")
         is_valid = False
         
     if total_kargo_dry > (total_hold_capacity - len(reefer_plugs_list) - len(dg_zones_list)) and is_valid:
-         st.sidebar.warning("⚠️ **Peringatan Kepadatan:** Slot reguler tidak cukup. Kargo DRY berisiko merampas area slot khusus!")
+         st.sidebar.warning("**Peringatan Kepadatan:** Slot reguler tidak cukup. Kargo DRY berisiko merampas area slot khusus!")
 
     if is_valid:
-        st.sidebar.success("✅ **Validasi Sukses:** Semua tipe peti kemas memenuhi kriteria kapasitas dan pembagian zona kapal.")
+        st.sidebar.success("**Validasi Sukses:** Semua tipe peti kemas memenuhi kriteria kapasitas dan pembagian zona kapal.")
 
-    if is_valid and st.sidebar.button("🚀 Jalankan Optimasi Algoritma"):
+    if is_valid and st.sidebar.button("Optimasi Susunan Kargo"):
         with st.spinner("Mengeksekusi Pencarian Solusi Terbaik..."):
             optimizer = StowageGA(vessel_info, cargo_df, pop_size, generations, mutation_rate)
             best_layout, final_fit, metrics, fit_history = optimizer.run()
@@ -373,10 +465,10 @@ if uploaded_cargo is not None:
         col_m3.metric("Pelanggaran Overstowage", f"{metrics['overstowage']} Kasus")
         col_m4.metric("Pelanggaran Slot Khusus", f"{metrics['slot_error']} Unit")
 
-        tab1, tab2, tab3 = st.tabs(["📊 Canvas Visualisasi 3D Interaktif", "📈 Grafik Kemajuan GA", "📋 Data Hasil Optimal"])
+        tab1, tab2, tab3 = st.tabs(["Grafik Visualisasi 3D", "Grafik Progress GA", "Data Hasil Optimasi"])
 
         with tab1:
-            st.write("#### 📦 Denah Digital Tata Letak Kubus Kontainer Palka Tiga Dimensi")
+            st.write("Denah Digital Tata Letak Kubus Kontainer Palka Tiga Dimensi")
             fig = go.Figure()
 
             color_map = {1: "#2ecc71", 2: "#2980b9", 3: "#8e44ad"}
@@ -390,7 +482,7 @@ if uploaded_cargo is not None:
                 if item['Tipe Cargo'].upper() == 'REEFER': display_text += "\n[R]"
                 elif item['Tipe Cargo'].upper() == 'DG': display_text += "\n[DG]"
 
-                hover_info = (f"📦 <b>Kargo: {item['Container ID']}</b><br>"
+                hover_info = (f"<b>Kargo: {item['Container ID']}</b><br>"
                               f"Dimensi Size: {item['Size Type']}<br>"
                               f"Berat: {item['Berat (Ton)']} Ton<br>"
                               f"Jenis: {item['Tipe Cargo']}<br>"
@@ -420,15 +512,15 @@ if uploaded_cargo is not None:
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("💡 Petunjuk Navigasi: Klik + tahan mouse kiri untuk memutar (Rotate), mouse kanan untuk menggeser, dan gunakan scroll untuk memperbesar kubus (Zoom).")
+            st.caption("Petunjuk Navigasi: Klik + tahan mouse kiri untuk memutar (Rotate), mouse kanan untuk menggeser, dan gunakan scroll untuk memperbesar kubus (Zoom).")
 
         with tab2:
-            st.write("#### Kurva Kemajuan Fitness Score Genetika Berdasarkan Generasi")
+            st.write("Kurva Kemajuan Fitness Score Genetika Berdasarkan Generasi")
             history_df = pd.DataFrame({"Generasi": list(range(1, len(fit_history)+1)), "Fitness Score": fit_history})
             st.line_chart(data=history_df, x="Generasi", y="Fitness Score")
 
         with tab3:
-            st.write("#### Manifest Hasil Penempatan Stowage Plan Teroptimal")
+            st.write("Manifest Hasil Penempatan Stowage Plan Teroptimal")
             export_data = []
             for coord, item in best_layout.items():
                 export_data.append({
@@ -443,6 +535,6 @@ if uploaded_cargo is not None:
             st.dataframe(res_df, use_container_width=True)
             
             csv_file = res_df.to_csv(index=False).encode('utf-8')
-            st.download_button(label="📥 Download Laporan Stowage Plan (.CSV)", data=csv_file, file_name=f"Stowage_Plan_{selected_vessel_name}.csv", mime="text/csv")
+            st.download_button(label="Download Laporan Stowage Plan (.CSV)", data=csv_file, file_name=f"Stowage_Plan_{selected_vessel_name}.csv", mime="text/csv")
 else:
-    st.info("💡 Silakan pilih Kapal di panel kiri, lalu unggah file kargo dummy Anda untuk memetakan susunan kubus palka kapal otomatis.")
+    st.info("Silakan pilih Kapal di panel kiri, lalu unggah file kargo dummy Anda untuk memetakan susunan kubus palka kapal otomatis.")
